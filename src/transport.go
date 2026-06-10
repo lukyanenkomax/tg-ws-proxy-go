@@ -52,6 +52,44 @@ func bridgeWS(label string, dc int, isMedia bool, client net.Conn, ws *websocket
 
 	done := make(chan struct{}, 2)
 
+	// --- НАЧАЛО ИЗМЕНЕНИЙ: Инициализация таймаутов и обработчика Pong ---
+	const (
+		wsPingPeriod = 30 * time.Second // Каждые 30 сек шлем Пинг
+		wsWriteWait  = 10 * time.Second // 10 сек на отправку Пинга
+		wsPongWait   = 60 * time.Second // Ждем Понг 60 сек (больше, чем период пинга)
+	)
+
+	// Настраиваем PongHandler. Когда Telegram присылает Pong, 
+	// библиотека gorilla/websocket сама его перехватит и вызовет эту функцию,
+	// сдвинув дедлайн чтения вебсокета вперед.
+	ws.SetPongHandler(func(string) error {
+		_ = ws.SetReadDeadline(time.Now().Add(wsPongWait))
+		return nil
+	})
+
+	// Отдельный канал для остановки горутины пинга, когда сессия закроется
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+
+	// Фоновая горутина отправки пингов
+	go func() {
+		ticker := time.NewTicker(wsPingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				_ = ws.SetWriteDeadline(time.Now().Add(wsWriteWait))
+				if err := ws.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			case <-pingDone:
+				return
+			}
+		}
+	}()
+	// --- КОНЕЦ ИЗМЕНЕНИЙ ---
+
+	// Первая горутина: Чтение от Клиента -> Запись в WebSocket (без изменений)
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buf := ioBufPool.Get().([]byte)
@@ -107,6 +145,7 @@ func bridgeWS(label string, dc int, isMedia bool, client net.Conn, ws *websocket
 		}
 	}()
 
+	// Вторая горутина: Чтение из WebSocket -> Запись Клиенту (ИЗМЕНЕНО)
 	go func() {
 		defer func() { done <- struct{}{} }()
 		var downPending int64
@@ -116,7 +155,11 @@ func bridgeWS(label string, dc int, isMedia bool, client net.Conn, ws *websocket
 			}
 		}()
 		for {
-			_ = ws.SetReadDeadline(time.Now().Add(ioIdleTimeout))
+			// --- ИЗМЕНЕНО ---
+			// Вместо ioIdleTimeout мы используем wsPongWait, 
+			// так как WebSocket теперь живет за счет пингов.
+			_ = ws.SetReadDeadline(time.Now().Add(wsPongWait))
+			
 			mt, data, err := ws.ReadMessage()
 			if err != nil {
 				return
